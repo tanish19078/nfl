@@ -1,5 +1,9 @@
 import sys
 import os
+
+# Fix for protobuf compatibility issues in some Kaggle environments
+os.environ['PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION'] = 'python'
+
 import numpy as np
 import pandas as pd
 import torch
@@ -158,153 +162,147 @@ else:
     
 model.eval()
 
-# Initialize Environment
-print("Importing kaggle_environments...")
-try:
-    import kaggle_environments
-    print("kaggle_environments imported.")
-except ImportError:
-    print("kaggle_environments not found. Simulating loop if local.")
-    sys.exit(0)
 
-print("Importing make from kaggle_environments...")
+# ==========================================
+# 3. Main Submission Loop (CSV Based)
+# ==========================================
+
+DATA_DIR = "/kaggle/input/nfl-big-data-bowl-2026-prediction"
+
+# Debug: List directory contents
+print(f"Listing {DATA_DIR}...")
 try:
-    from kaggle_environments import make
-    print("make imported.")
+    if os.path.exists(DATA_DIR):
+        print(os.listdir(DATA_DIR))
+    else:
+        print(f"{DATA_DIR} not found.")
 except Exception as e:
-    print(f"Error importing make: {e}")
+    print(f"Error listing directory: {e}")
+
+# Load Data
+try:
+    # Try to load the input data (history) and the submission template (test)
+    # Note: Filenames might vary, checking for likely candidates
+    input_path = os.path.join(DATA_DIR, "test_input.csv")
+    test_path = os.path.join(DATA_DIR, "test.csv")
+    
+    if not os.path.exists(input_path):
+        # If test_input.csv doesn't exist, maybe test.csv has everything?
+        # But we just saw it missing 'x'.
+        print(f"Warning: {input_path} not found.")
+        # Fallback: maybe the user renamed it?
+        # We'll try to proceed with what we have, but it might fail.
+        df_in = pd.read_csv(test_path)
+    else:
+        print(f"Loading input history from {input_path}...")
+        df_in = pd.read_csv(input_path)
+        
+    print(f"Loading test queries from {test_path}...")
+    df_test = pd.read_csv(test_path)
+    
+except FileNotFoundError as e:
+    print(f"Error loading data: {e}")
     sys.exit(1)
 
-# Note: The competition environment name usually uses underscores.
-# We will try a few likely candidates.
-env_names = ["nfl-big-data-bowl-2026-prediction", "nfl_big_data_bowl_2025", "nfl_big_data_bowl_2026", "nfl-big-data-bowl-2025", "nfl-big-data-bowl-2026", "nfl"]
-env = None
+predictions = []
 
-for name in env_names:
-    try:
-        print(f"Attempting to load environment: {name}")
-        env = make(name, debug=True)
-        print(f"Successfully loaded {name}!")
-        break
-    except Exception:
+print("Preprocessing history data...")
+# Check if 'x' exists in df_in
+if 'x' not in df_in.columns:
+    print("Error: 'x' column missing from input data. Cannot proceed.")
+    print("Columns:", df_in.columns)
+    sys.exit(1)
+
+# Store original directions for post-processing (from history or test?)
+# Usually we need the direction of the play.
+# df_in should have it.
+direction_map = df_in[['game_id', 'play_id', 'nfl_id', 'play_direction']].drop_duplicates()
+
+df_proc = preprocess_dataframe(df_in)
+
+# Group history by player
+grouped_in = df_proc.groupby(['game_id', 'play_id', 'nfl_id'])
+
+# Get unique players to predict for from df_test
+# df_test usually contains the frames we need to predict.
+print(f"Predicting for {len(df_test)} rows in test.csv...")
+
+# We iterate over unique (game, play, nfl_id) in df_test
+unique_players = df_test[['game_id', 'play_id', 'nfl_id']].drop_duplicates()
+
+for _, row in unique_players.iterrows():
+    g, p, n = row['game_id'], row['play_id'], row['nfl_id']
+    
+    if (g, p, n) not in grouped_in.groups:
+        # No history for this player?
         continue
         
-if env is None:
-    print("Error: Could not load any NFL environment.")
-    print("Available environments:")
-    # Print available environments to help debug
-    try:
-        from kaggle_environments import list_environments
-        print(list_environments())
-    except ImportError:
-        print("Could not list environments.")
-    sys.exit(1)
+    # Get history
+    history = grouped_in.get_group((g, p, n))
+    
+    feature_cols = [
+        'x', 'y', 's', 'a', 'dir', 'o', 'vx', 'vy',
+        'dist_to_land', 'angle_to_land',
+        'role_Passer', 'role_Targeted Receiver', 'role_Defensive Coverage',
+        'role_Other Route Runner', 'role_Pass Rusher'
+    ]
 
-iter_test = env.iter_test()
+    for col in feature_cols:
+        if col not in history:
+            history[col] = 0.0
 
-print("Starting prediction loop...")
+    features = history[feature_cols].values.astype(np.float32)
+    tensor = torch.tensor(features).unsqueeze(0).to(device)
 
-for (test_df, sample_prediction_df) in iter_test:
-    # test_df contains data for the current play(s)
+    # Determine how many frames to predict
+    # We need to cover all frame_ids requested in df_test for this player
+    req_frames_df = df_test[
+        (df_test['game_id'] == g) & 
+        (df_test['play_id'] == p) & 
+        (df_test['nfl_id'] == n)
+    ]
     
-    # Store original directions for post-processing
-    direction_map = test_df[['game_id', 'play_id', 'nfl_id', 'play_direction']].drop_duplicates()
-    
-    # Apply features
-    df_proc = preprocess_dataframe(test_df)
-    
-    # Group by player
-    grouped = df_proc.groupby(['game_id', 'play_id', 'nfl_id'])
-    
-    predictions = []
-    
-    # Get unique players to predict for
-    players_to_predict = sample_prediction_df[['game_id', 'play_id', 'nfl_id']].drop_duplicates()
-    
-    for _, row in players_to_predict.iterrows():
-        g_id, p_id, n_id = row['game_id'], row['play_id'], row['nfl_id']
+    if req_frames_df.empty:
+        continue
         
-        if (g_id, p_id, n_id) not in grouped.groups:
-            continue
-            
-        history = grouped.get_group((g_id, p_id, n_id))
+    # Assuming we just need to predict N frames ahead
+    num_frames = len(req_frames_df)
+
+    with torch.no_grad():
+        preds = model(tensor, future_frames=num_frames)
         
-        # Extract features
-        feature_cols = [
-            'x', 'y', 's', 'a', 'dir', 'o', 'vx', 'vy', 
-            'dist_to_land', 'angle_to_land',
-            'role_Passer', 'role_Targeted Receiver', 'role_Defensive Coverage', 
-            'role_Other Route Runner', 'role_Pass Rusher'
-        ]
-        
-        # Handle missing cols
-        for col in feature_cols:
-            if col not in history.columns:
-                history[col] = 0.0
-        
-        features = history[feature_cols].values.astype(np.float32)
-        features_tensor = torch.tensor(features).unsqueeze(0).to(device)
-        
-        # Determine frames to predict
-        req_frames_df = sample_prediction_df[
-            (sample_prediction_df['game_id'] == g_id) & 
-            (sample_prediction_df['play_id'] == p_id) & 
-            (sample_prediction_df['nfl_id'] == n_id)
-        ]
-        
-        if req_frames_df.empty:
-            continue
-            
-        num_frames = len(req_frames_df)
-        
-        with torch.no_grad():
-            preds = model(features_tensor, future_frames=num_frames)
-            
-        preds_np = preds.squeeze(0).cpu().numpy()
-        
-        # Post-process (Reflect back if needed)
+    preds_np = preds.squeeze(0).cpu().numpy()
+
+    # Post-process (Reflect back if needed)
+    # Find direction
+    if not direction_map[(direction_map['game_id'] == g) & (direction_map['play_id'] == p)].empty:
         p_dir = direction_map[
-            (direction_map['game_id'] == g_id) & 
-            (direction_map['play_id'] == p_id) &
-            (direction_map['nfl_id'] == n_id)
+            (direction_map['game_id'] == g) & 
+            (direction_map['play_id'] == p)
         ]['play_direction'].iloc[0]
         
         if p_dir == 'left':
             preds_np[:, 0] = 120 - preds_np[:, 0]
             preds_np[:, 1] = 53.3 - preds_np[:, 1]
-            
-        # Fill predictions
-        req_frames_df = req_frames_df.sort_values('frame_id')
-        
-        for i, (idx, req_row) in enumerate(req_frames_df.iterrows()):
-            if i < len(preds_np):
-                predictions.append({
-                    'game_id': g_id,
-                    'play_id': p_id,
-                    'nfl_id': n_id,
-                    'frame_id': req_row['frame_id'],
-                    'x': preds_np[i, 0],
-                    'y': preds_np[i, 1]
-                })
-                
-    # Create DataFrame
-    if predictions:
-        pred_df = pd.DataFrame(predictions)
-        
-        # Efficient update
-        pred_df.set_index(['game_id', 'play_id', 'nfl_id', 'frame_id'], inplace=True)
-        sample_prediction_df.set_index(['game_id', 'play_id', 'nfl_id', 'frame_id'], inplace=True)
-        
-        sample_prediction_df.update(pred_df)
-        sample_prediction_df.reset_index(inplace=True)
-        
-        sample_prediction_df.fillna(0, inplace=True)
-    else:
-        # Fallback if no predictions
-        sample_prediction_df['x'] = 0.0
-        sample_prediction_df['y'] = 0.0
-        
-    # Submit
-    env.predict(sample_prediction_df)
 
-print("Submission complete.")
+    # Build rows for submission
+    # We assume the predictions correspond to the requested frames in order
+    req_frames_df = req_frames_df.sort_values('frame_id')
+    
+    for i, (idx, req_row) in enumerate(req_frames_df.iterrows()):
+        if i < len(preds_np):
+            predictions.append({
+                "game_id": g,
+                "play_id": p,
+                "nfl_id": n,
+                "frame_id": req_row['frame_id'],
+                "x": preds_np[i, 0],
+                "y": preds_np[i, 1],
+            })
+
+pred_df = pd.DataFrame(predictions)
+# Merge with df_test to ensure we have all rows and correct order if needed
+# But usually submission just needs the rows.
+# Let's just save what we predicted.
+pred_df.to_csv("submission.csv", index=False)
+print("Submission complete. Saved to submission.csv")
