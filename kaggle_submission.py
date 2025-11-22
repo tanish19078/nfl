@@ -159,13 +159,21 @@ else:
 model.eval()
 
 # Initialize Environment
+print("Importing kaggle_environments...")
 try:
     import kaggle_environments
+    print("kaggle_environments imported.")
 except ImportError:
     print("kaggle_environments not found. Simulating loop if local.")
     sys.exit(0)
 
-from kaggle_environments import make
+print("Importing make from kaggle_environments...")
+try:
+    from kaggle_environments import make
+    print("make imported.")
+except Exception as e:
+    print(f"Error importing make: {e}")
+    sys.exit(1)
 
 # Note: The competition environment name usually uses underscores.
 # We will try a few likely candidates.
