@@ -169,15 +169,7 @@ model.eval()
 
 DATA_DIR = "/kaggle/input/nfl-big-data-bowl-2026-prediction"
 
-# Debug: List directory contents
-print(f"Listing {DATA_DIR}...")
-try:
-    if os.path.exists(DATA_DIR):
-        print(os.listdir(DATA_DIR))
-    else:
-        print(f"{DATA_DIR} not found.")
-except Exception as e:
-    print(f"Error listing directory: {e}")
+
 
 # Load Data
 try:
@@ -213,12 +205,13 @@ if 'x' not in df_in.columns:
     print("Columns:", df_in.columns)
     sys.exit(1)
 
-# Store original directions for post-processing (from history or test?)
-# Usually we need the direction of the play.
-# df_in should have it.
-direction_map = df_in[['game_id', 'play_id', 'nfl_id', 'play_direction']].drop_duplicates()
-
 df_proc = preprocess_dataframe(df_in)
+
+# Correct direction: Extract AFTER preprocessing to ensure we have standardized/filled columns if needed
+# Although 'play_direction' is usually in the raw data, extracting it from the processed df 
+# ensures we are aligned with any changes (though preprocess usually doesn't change the label itself).
+# The user noted: "Because direction_map was created before direction preprocessing."
+direction_map = df_proc[['game_id', 'play_id', 'nfl_id', 'play_direction']].drop_duplicates()
 
 # Group history by player
 grouped_in = df_proc.groupby(['game_id', 'play_id', 'nfl_id'])
@@ -254,8 +247,13 @@ for _, row in unique_players.iterrows():
     features = history[feature_cols].values.astype(np.float32)
     tensor = torch.tensor(features).unsqueeze(0).to(device)
 
-    # Determine how many frames to predict
-    # We need to cover all frame_ids requested in df_test for this player
+    # Get last frame from history
+    if 'frame_id' in history.columns:
+        last_frame = history['frame_id'].iloc[-1]
+    else:
+        last_frame = 0
+
+    # Determine max prediction horizon needed
     req_frames_df = df_test[
         (df_test['game_id'] == g) & 
         (df_test['play_id'] == p) & 
@@ -265,40 +263,64 @@ for _, row in unique_players.iterrows():
     if req_frames_df.empty:
         continue
         
-    # Assuming we just need to predict N frames ahead
-    num_frames = len(req_frames_df)
+    req_frame_ids = req_frames_df['frame_id'].values
+    max_req_frame = req_frame_ids.max()
+    max_delta = max_req_frame - last_frame
+    
+    preds_np = None
+    if max_delta > 0:
+        with torch.no_grad():
+            preds = model(tensor, future_frames=int(max_delta))
+        preds_np = preds.squeeze(0).cpu().numpy()
 
-    with torch.no_grad():
-        preds = model(tensor, future_frames=num_frames)
-        
-    preds_np = preds.squeeze(0).cpu().numpy()
-
-    # Post-process (Reflect back if needed)
-    # Find direction
-    if not direction_map[(direction_map['game_id'] == g) & (direction_map['play_id'] == p)].empty:
-        p_dir = direction_map[
-            (direction_map['game_id'] == g) & 
-            (direction_map['play_id'] == p)
-        ]['play_direction'].iloc[0]
-        
-        if p_dir == 'left':
-            preds_np[:, 0] = 120 - preds_np[:, 0]
-            preds_np[:, 1] = 53.3 - preds_np[:, 1]
+        # Post-process (Reflect back if needed)
+        if not direction_map[(direction_map['game_id'] == g) & (direction_map['play_id'] == p)].empty:
+            p_dir = direction_map[
+                (direction_map['game_id'] == g) & 
+                (direction_map['play_id'] == p)
+            ]['play_direction'].iloc[0]
+            
+            if p_dir == 'left':
+                preds_np[:, 0] = 120 - preds_np[:, 0]
+                # preds_np[:, 1] = 53.3 - preds_np[:, 1] # Do not reflect Y for predictions
 
     # Build rows for submission
-    # We assume the predictions correspond to the requested frames in order
-    req_frames_df = req_frames_df.sort_values('frame_id')
-    
-    for i, (idx, req_row) in enumerate(req_frames_df.iterrows()):
-        if i < len(preds_np):
-            predictions.append({
-                "game_id": g,
-                "play_id": p,
-                "nfl_id": n,
-                "frame_id": req_row['frame_id'],
-                "x": preds_np[i, 0],
-                "y": preds_np[i, 1],
-            })
+    for f_id in req_frame_ids:
+        delta = f_id - last_frame
+        val_x, val_y = 0.0, 0.0
+        
+        if delta > 0:
+            idx = int(delta) - 1
+            if preds_np is not None and idx < len(preds_np):
+                val_x = preds_np[idx, 0]
+                val_y = preds_np[idx, 1]
+        else:
+            # Use history
+            hist_row = history[history['frame_id'] == f_id]
+            if not hist_row.empty:
+                val_x = hist_row['x'].iloc[0]
+                val_y = hist_row['y'].iloc[0]
+                
+                # Reverse standardization for history
+                # History was flipped BOTH X and Y in preprocess
+                if not direction_map[(direction_map['game_id'] == g) & (direction_map['play_id'] == p)].empty:
+                    p_dir = direction_map[
+                        (direction_map['game_id'] == g) & 
+                        (direction_map['play_id'] == p)
+                    ]['play_direction'].iloc[0]
+                    
+                    if p_dir == 'left':
+                        val_x = 120 - val_x
+                        val_y = 53.3 - val_y
+
+        predictions.append({
+            "game_id": g,
+            "play_id": p,
+            "nfl_id": n,
+            "frame_id": f_id,
+            "x": val_x,
+            "y": val_y,
+        })
 
 pred_df = pd.DataFrame(predictions)
 # Merge with df_test to ensure we have all rows and correct order if needed
