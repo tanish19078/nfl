@@ -105,6 +105,31 @@ def calculate_relative_to_landing(df: pd.DataFrame) -> pd.DataFrame:
     df['angle_to_land'] = np.arctan2(dy, dx)
     return df
 
+def calculate_interaction_features(df: pd.DataFrame) -> pd.DataFrame:
+    df['dist_to_nearest_opponent'] = 20.0
+    if 'player_side' not in df.columns:
+        return df
+    
+    required_cols = ['game_id', 'play_id', 'frame_id', 'nfl_id', 'x', 'y', 'player_side']
+    if not all(c in df.columns for c in required_cols):
+        return df
+        
+    coords = df[['game_id', 'play_id', 'frame_id', 'nfl_id', 'player_side', 'x', 'y']].copy()
+    merged = coords.merge(coords, on=['game_id', 'play_id', 'frame_id'], suffixes=('', '_opp'))
+    merged = merged[merged['player_side'] != merged['player_side_opp']]
+    
+    if merged.empty:
+        return df
+        
+    merged['dist'] = np.sqrt((merged['x'] - merged['x_opp'])**2 + (merged['y'] - merged['y_opp'])**2)
+    min_dists = merged.groupby(['game_id', 'play_id', 'frame_id', 'nfl_id'])['dist'].min().reset_index()
+    min_dists.rename(columns={'dist': 'dist_to_nearest_opponent'}, inplace=True)
+    
+    df = df.merge(min_dists, on=['game_id', 'play_id', 'frame_id', 'nfl_id'], how='left')
+    df['dist_to_nearest_opponent'] = df['dist_to_nearest_opponent_y'].fillna(df['dist_to_nearest_opponent_x'])
+    df = df.drop(columns=['dist_to_nearest_opponent_x', 'dist_to_nearest_opponent_y'])
+    return df
+
 def encode_roles(df: pd.DataFrame) -> pd.DataFrame:
     if 'player_role' not in df.columns:
         # If role not provided, create dummy columns
@@ -135,6 +160,7 @@ def preprocess_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     df = standardize_direction(df)
     df = calculate_kinematics(df)
     df = calculate_relative_to_landing(df)
+    # df = calculate_interaction_features(df)
     df = encode_roles(df)
     return df
 
